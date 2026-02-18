@@ -1,9 +1,11 @@
 [project]
-name = "sophia-dispatch"
-version = "0.1.0"
-description = "Local inter-agent messaging for Sophia instances via MCP"
+name = "mcp-dispatch"
+version = "0.2.0"
+description = "Local inter-agent messaging for AI coding agents via MCP"
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]>=1.0",
-    "watchdog>=4.0",
 ]
+
+[project.optional-dependencies]
+watch = ["watchdog>=4.0"]
