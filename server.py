@@ -17,11 +17,9 @@ Configuration:
 
 Tools:
   dispatch(message, target, ...)  — send to one agent or all
-  peek(...)                       — non-destructive read of pending messages
+  peek(...)                       — read inbox + delivery receipts for sent messages
   ack(message_ids)                — acknowledge and delete processed messages
-  heartbeat()                     — check for messages between work phases
   who()                           — list connected agents
-  status(message_id, target)      — check delivery receipt for a sent message
 """
 
 from __future__ import annotations
@@ -386,6 +384,32 @@ def _discover_agents() -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _get_sent_receipts(agent_id: str) -> list[dict]:
+    """Check delivery state of messages sent by this agent across all inboxes."""
+    receipts = []
+    for agent in _discover_agents():
+        if agent == agent_id:
+            continue
+        inbox = DISPATCH_DIR / agent
+        if not inbox.is_dir():
+            continue
+        for f in inbox.glob("*.json"):
+            try:
+                msg = json.loads(f.read_text())
+                if msg.get("from") == agent_id:
+                    receipts.append({
+                        "id": msg["id"],
+                        "to": agent,
+                        "state": msg.get("state", "pending"),
+                        "read_at": msg.get("read_at"),
+                        "sent_at": msg.get("timestamp"),
+                        "preview": msg.get("content", "")[:60],
+                    })
+            except (json.JSONDecodeError, OSError):
+                continue
+    return receipts
+
+
 def _with_pending(result: dict) -> dict:
     """Attach NEW (pending) messages to a tool response, marking them read."""
     _cleanup_expired(AGENT_ID)
@@ -454,10 +478,9 @@ _start_watcher(AGENT_ID)
 _default_instructions = (
     "This is the MCP Dispatch server. You are agent '{agent_id}'. "
     "Use dispatch() to send messages to other agents, "
-    "peek() to read incoming messages (non-destructive), "
+    "peek() to read incoming messages and check delivery receipts for sent messages, "
     "ack() to acknowledge processed messages, "
-    "heartbeat() to check for messages between work phases, "
-    "who() to see who's online, and status() to check delivery receipts. "
+    "who() to see who's online. "
     "Messages from others are also included in every tool response (piggyback delivery). "
     "Available targets: {agent_list}."
 )
@@ -527,14 +550,15 @@ def dispatch_tool(
         "By default returns only NEW (unread) messages. "
         "Set include_read=true to see ALL unacknowledged messages. "
         "Filter by thread_id to see a specific conversation. "
-        "Use ack() to acknowledge messages when you're done with them."
+        "Use ack() to acknowledge messages when you're done with them. "
+        "Also returns delivery receipts for your recently sent messages."
     ),
 )
 def peek_tool(
     thread_id: Optional[str] = None,
     include_read: bool = False,
 ) -> dict:
-    """Non-destructive read of inbox messages."""
+    """Non-destructive read of inbox messages plus sent message receipts."""
     _cleanup_expired(AGENT_ID)
 
     if include_read:
@@ -547,11 +571,18 @@ def peek_tool(
 
     # Clean internal fields
     clean = [{k: v for k, v in m.items() if not k.startswith("_")} for m in messages]
-    return {
+
+    # Delivery receipts for sent messages
+    receipts = _get_sent_receipts(AGENT_ID)
+
+    result = {
         "agent_id": AGENT_ID,
         "messages": clean,
         "count": len(clean),
     }
+    if receipts:
+        result["sent_receipts"] = receipts
+    return result
 
 
 @mcp.tool(
@@ -594,24 +625,6 @@ def ack_tool(
 
 
 @mcp.tool(
-    name="heartbeat",
-    description=(
-        "Check for pending messages without doing anything else. "
-        "Call this between major work phases to see if other agents "
-        "need your attention. Returns pending messages if any."
-    ),
-)
-def heartbeat_tool() -> dict:
-    """No-op that triggers piggyback delivery."""
-    return _with_pending(
-        {
-            "agent_id": AGENT_ID,
-            "status": "alive",
-        }
-    )
-
-
-@mcp.tool(
     name="who",
     description="List all currently connected agents and their status.",
 )
@@ -635,39 +648,6 @@ def who_tool() -> dict:
         "agents": agents,
         "count": len(agents),
     }
-
-
-@mcp.tool(
-    name="status",
-    description=(
-        "Check the delivery state of a message you sent. "
-        "Pass the message_id and the target agent's name. "
-        "Returns the message state: pending (unread), read, or acked_or_expired."
-    ),
-)
-def status_tool(
-    message_id: str,
-    target: str,
-) -> dict:
-    """Check receipt state of a sent message."""
-    target_inbox = DISPATCH_DIR / target
-    if not target_inbox.is_dir():
-        return {"message_id": message_id, "target": target, "state": "unknown_target"}
-
-    for f in target_inbox.glob("*.json"):
-        try:
-            msg = json.loads(f.read_text())
-            if msg.get("id") == message_id:
-                return {
-                    "message_id": message_id,
-                    "target": target,
-                    "state": msg.get("state", "pending"),
-                    "read_at": msg.get("read_at"),
-                }
-        except (json.JSONDecodeError, OSError):
-            continue
-
-    return {"message_id": message_id, "target": target, "state": "acked_or_expired"}
 
 
 if __name__ == "__main__":

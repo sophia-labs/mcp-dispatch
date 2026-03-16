@@ -10,7 +10,7 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 - **Threading** — Group messages into conversations with `thread_id` and `reply_to`.
 - **Structured payloads** — Attach machine-readable data alongside human-readable messages.
 - **TTL & must_read** — Time-sensitive messages auto-expire. Critical messages survive until acknowledged.
-- **Delivery receipts** — Check if your message was received and read.
+- **Delivery receipts** — `peek()` shows read/unread state of messages you've sent.
 - **Config-driven** — TOML config for agent rosters, directories, and limits. Or go dynamic with no roster.
 - **Zero infrastructure** — Filesystem relay survives process crashes. No daemon to manage.
 
@@ -68,11 +68,9 @@ Agent bob:   ack(["msg-abc12345"])  →  message removed
 | Tool | Description |
 |------|-------------|
 | `dispatch(message, target, ...)` | Send a message to one agent or all |
-| `peek(thread_id?, include_read?)` | Read messages without deleting them |
+| `peek(thread_id?, include_read?)` | Read messages and delivery receipts for sent messages |
 | `ack(message_ids)` | Acknowledge and delete processed messages |
-| `heartbeat()` | Check for messages between work phases |
 | `who()` | List connected agents |
-| `status(message_id, target)` | Check delivery state of a sent message |
 
 ### dispatch
 
