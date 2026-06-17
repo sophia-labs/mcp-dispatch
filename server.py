@@ -410,9 +410,54 @@ def _get_sent_receipts(agent_id: str) -> list[dict]:
     return receipts
 
 
+_LAST_PIGGYBACK_FLOOR: float = 0.0
+
+
+def _inbox_signals(agent_id: str) -> tuple[int, int]:
+    """Compute (unread_count, new_since_last) for the agent's inbox.
+
+    `unread_count` = total messages in the inbox, regardless of read/pending
+    state. This is what the caller needs to decide whether peek() is even
+    worth calling.
+
+    `new_since_last` = count of message files whose mtime is newer than the
+    most recent piggyback observation. Updates `_LAST_PIGGYBACK_FLOOR` so
+    the next call sees a fresh count. This is the primary signal an agent
+    should use to know whether to call peek.
+    """
+    global _LAST_PIGGYBACK_FLOOR
+    inbox = DISPATCH_DIR / agent_id
+    if not inbox.is_dir():
+        return 0, 0
+    total = 0
+    fresh = 0
+    new_floor = _LAST_PIGGYBACK_FLOOR
+    for f in inbox.glob("*.json"):
+        try:
+            mtime = f.stat().st_mtime
+        except OSError:
+            continue
+        total += 1
+        if mtime > _LAST_PIGGYBACK_FLOOR:
+            fresh += 1
+        if mtime > new_floor:
+            new_floor = mtime
+    _LAST_PIGGYBACK_FLOOR = new_floor
+    return total, fresh
+
+
 def _with_pending(result: dict) -> dict:
-    """Attach NEW (pending) messages to a tool response, marking them read."""
+    """Attach NEW (pending) messages to a tool response, marking them read.
+
+    Also attaches inbox signals — `unread_count` and `new_since_last` —
+    so the caller can decide whether peek is worth the round-trip. These
+    fields are always present even when there's nothing to deliver, so
+    the caller has a stable shape to inspect.
+    """
     _cleanup_expired(AGENT_ID)
+    unread_count, new_since_last = _inbox_signals(AGENT_ID)
+    result["unread_count"] = unread_count
+    result["new_since_last"] = new_since_last
     messages = _read_inbox(AGENT_ID, state_filter="pending")
     if messages:
         # Strip internal _file before exposing, but keep for _mark_read
@@ -547,36 +592,73 @@ def dispatch_tool(
     name="peek",
     description=(
         "Read incoming messages without deleting them. "
-        "By default returns only NEW (unread) messages. "
+        "By default returns only NEW (unread) messages with full bodies. "
         "Set include_read=true to see ALL unacknowledged messages. "
         "Filter by thread_id to see a specific conversation. "
         "Use ack() to acknowledge messages when you're done with them. "
-        "Also returns delivery receipts for your recently sent messages."
+        "Also returns delivery receipts for your recently sent messages.\n\n"
+        "Modes:\n"
+        "- mode='full' (default): each message returned with full content + payload.\n"
+        "- mode='metadata': each message returned as {id, from, ts, priority, "
+        "preview_120, size_bytes, thread_id, state} — no full body. ~80% smaller; "
+        "use this for defensive polling.\n\n"
+        "since: ISO8601 timestamp filter — only return messages with timestamp >= since."
     ),
 )
 def peek_tool(
     thread_id: Optional[str] = None,
     include_read: bool = False,
+    mode: str = "full",
+    since: Optional[str] = None,
 ) -> dict:
     """Non-destructive read of inbox messages plus sent message receipts."""
     _cleanup_expired(AGENT_ID)
+
+    if mode not in ("full", "metadata"):
+        raise ValueError("mode must be 'full' or 'metadata'")
 
     if include_read:
         messages = _read_inbox(AGENT_ID, thread_id=thread_id)
     else:
         messages = _read_inbox(AGENT_ID, state_filter="pending", thread_id=thread_id)
 
-    # Mark pending → read
-    _mark_read(messages)
+    if since:
+        since_ts = _parse_timestamp(since)
+        if since_ts > 0:
+            messages = [
+                m for m in messages
+                if _parse_timestamp(m.get("timestamp", "")) >= since_ts
+            ]
 
-    # Clean internal fields
-    clean = [{k: v for k, v in m.items() if not k.startswith("_")} for m in messages]
+    # Mark pending → read (in full mode only — metadata polling should not
+    # silently consume the unread signal).
+    if mode == "full":
+        _mark_read(messages)
+
+    if mode == "metadata":
+        clean = [
+            {
+                "id": m.get("id"),
+                "from": m.get("from"),
+                "ts": m.get("timestamp"),
+                "priority": m.get("priority", "normal"),
+                "preview_120": (m.get("content") or "")[:120],
+                "size_bytes": len(json.dumps({k: v for k, v in m.items() if not k.startswith("_")}).encode("utf-8")),
+                "thread_id": m.get("thread_id"),
+                "state": m.get("state", "pending"),
+            }
+            for m in messages
+        ]
+    else:
+        # Clean internal fields
+        clean = [{k: v for k, v in m.items() if not k.startswith("_")} for m in messages]
 
     # Delivery receipts for sent messages
     receipts = _get_sent_receipts(AGENT_ID)
 
     result = {
         "agent_id": AGENT_ID,
+        "mode": mode,
         "messages": clean,
         "count": len(clean),
     }
