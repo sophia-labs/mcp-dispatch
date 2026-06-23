@@ -135,3 +135,40 @@ def test_peek_metadata_preview_120_truncates_correctly(isolated_dispatch) -> Non
 
     result = srv.peek_tool(mode="metadata")
     assert result["messages"][0]["preview_120"] == short_body
+
+
+def test_with_pending_does_not_redeliver_old_message_as_new(isolated_dispatch) -> None:
+    """Epsilon's #4 finding — _mark_read rewrites file mtime AFTER the
+    new_since_last count snapshot, so on the next piggyback the rewritten
+    file appears `> floor` and gets counted as fresh. Fix: snap the floor
+    AFTER mark_read so the rewrites sit at the floor, not above it."""
+    srv = isolated_dispatch
+    srv._LAST_PIGGYBACK_FLOOR = 0.0
+
+    _deliver(srv, "beta", "first message")
+    first = srv._with_pending({"sent": True})
+    assert first["new_since_last"] == 1
+    assert first.get("_dispatch_count") == 1
+
+    # No new messages delivered. The next piggyback should NOT see the
+    # already-delivered message as fresh again, even though _mark_read
+    # rewrote its file (bumping mtime).
+    second = srv._with_pending({"sent": True})
+    assert second["new_since_last"] == 0
+    assert "_dispatch_count" not in second or second.get("_dispatch_count") is None
+
+
+def test_with_pending_signals_genuinely_new_message_after_first_delivery(isolated_dispatch) -> None:
+    """Sanity guard: the floor advance does not swallow genuine new traffic."""
+    srv = isolated_dispatch
+    srv._LAST_PIGGYBACK_FLOOR = 0.0
+
+    _deliver(srv, "beta", "first")
+    srv._with_pending({"sent": True})
+
+    # Sleep to guarantee the new message has a distinctly higher mtime than
+    # the rewrite floor.
+    time.sleep(1.1)
+    _deliver(srv, "gamma", "second")
+    third = srv._with_pending({"sent": True})
+    assert third["new_since_last"] == 1

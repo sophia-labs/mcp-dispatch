@@ -413,37 +413,30 @@ def _get_sent_receipts(agent_id: str) -> list[dict]:
 _LAST_PIGGYBACK_FLOOR: float = 0.0
 
 
-def _inbox_signals(agent_id: str) -> tuple[int, int]:
-    """Compute (unread_count, new_since_last) for the agent's inbox.
+def _count_inbox_against_floor(agent_id: str, floor: float) -> tuple[int, int, float]:
+    """Return (total, fresh, max_mtime_seen) for the agent's inbox.
 
-    `unread_count` = total messages in the inbox, regardless of read/pending
-    state. This is what the caller needs to decide whether peek() is even
-    worth calling.
-
-    `new_since_last` = count of message files whose mtime is newer than the
-    most recent piggyback observation. Updates `_LAST_PIGGYBACK_FLOOR` so
-    the next call sees a fresh count. This is the primary signal an agent
-    should use to know whether to call peek.
+    Counts files whose mtime is strictly greater than `floor` as fresh.
+    Does NOT mutate `_LAST_PIGGYBACK_FLOOR` — the caller is responsible for
+    advancing the floor at the right moment in the piggyback sequence.
     """
-    global _LAST_PIGGYBACK_FLOOR
     inbox = DISPATCH_DIR / agent_id
     if not inbox.is_dir():
-        return 0, 0
+        return 0, 0, floor
     total = 0
     fresh = 0
-    new_floor = _LAST_PIGGYBACK_FLOOR
+    max_mtime = floor
     for f in inbox.glob("*.json"):
         try:
             mtime = f.stat().st_mtime
         except OSError:
             continue
         total += 1
-        if mtime > _LAST_PIGGYBACK_FLOOR:
+        if mtime > floor:
             fresh += 1
-        if mtime > new_floor:
-            new_floor = mtime
-    _LAST_PIGGYBACK_FLOOR = new_floor
-    return total, fresh
+        if mtime > max_mtime:
+            max_mtime = mtime
+    return total, fresh, max_mtime
 
 
 def _with_pending(result: dict) -> dict:
@@ -453,11 +446,23 @@ def _with_pending(result: dict) -> dict:
     so the caller can decide whether peek is worth the round-trip. These
     fields are always present even when there's nothing to deliver, so
     the caller has a stable shape to inspect.
+
+    Floor advancement order (epsilon's #4 finding): count first, deliver
+    next, then snap the floor to the CURRENT inbox max-mtime after
+    `_mark_read` rewrites the delivered files. That way the just-rewritten
+    files don't get counted as "new" on the next call — their post-rewrite
+    mtime sits at the floor, not above it.
     """
+    global _LAST_PIGGYBACK_FLOOR
     _cleanup_expired(AGENT_ID)
-    unread_count, new_since_last = _inbox_signals(AGENT_ID)
+
+    # Phase 1: count against the existing floor (pre-delivery snapshot).
+    unread_count, new_since_last, _ = _count_inbox_against_floor(
+        AGENT_ID, _LAST_PIGGYBACK_FLOOR,
+    )
     result["unread_count"] = unread_count
     result["new_since_last"] = new_since_last
+
     messages = _read_inbox(AGENT_ID, state_filter="pending")
     if messages:
         # Strip internal _file before exposing, but keep for _mark_read
@@ -466,6 +471,13 @@ def _with_pending(result: dict) -> dict:
         clean = [{k: v for k, v in m.items() if not k.startswith("_")} for m in messages]
         result["_dispatches"] = clean
         result["_dispatch_count"] = len(clean)
+
+    # Phase 2: advance the floor to the inbox's CURRENT max mtime — this
+    # captures both `_mark_read`'s rewrites and any concurrent arrivals
+    # that landed between the count and the snap. Anything strictly newer
+    # than this floor on the next call is genuinely new traffic.
+    _, _, new_floor = _count_inbox_against_floor(AGENT_ID, _LAST_PIGGYBACK_FLOOR)
+    _LAST_PIGGYBACK_FLOOR = new_floor
     return result
 
 
